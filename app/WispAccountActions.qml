@@ -5,6 +5,7 @@ Item {
   id: root
   required property var bridge
   property var states: ({})
+  readonly property bool busy: onboarding.running || Object.keys(states).some(function(id) { return !!states[id].busy })
   function state(serverId) { return states[String(serverId)] || {busy:false,error:"",feedback:"",invitation:null,person:null,overview:{},invites:[]} }
   function put(serverId,patch) { states=bridge.replaceEntry(states,String(serverId),Object.assign({},state(serverId),patch)) }
   function act(command,args,serverId) {
@@ -24,6 +25,7 @@ Item {
     else {
       switch(request.command) {
         case "create_server_invite":patch.invitation=value;break
+        case "send_server_invite":patch.feedback="Invitation sent";break
         case "revoke_server_invite":patch.invitation=state(request.serverId).invitation && state(request.serverId).invitation.id===request.args.invite_id ? null : state(request.serverId).invitation;patch.invites=state(request.serverId).invites.filter(function(i){return i.id!==request.args.invite_id});patch.feedback="Invitation revoked";break
         case "list_server_invites":patch.invites=value.invites || [];break
         case "lookup_person":patch.person=value.person;patch.feedback=value.person ? "" : "No account found with that username.";break
@@ -38,6 +40,21 @@ Item {
     if(message.ok && ["block_person","unblock_person"].indexOf(request.command)>=0) act("account_overview",{},request.serverId)
   }
   property string incomingInvitation: ""
+  function invitationKey(serverId, messageId) {
+    return JSON.stringify([String(serverId),String(bridge.participantServer({server_id:serverId}).self.id || ""),String(messageId)])
+  }
+  function invitationDeclined(serverId, messageId) { return !!invitePreferences.declined[invitationKey(serverId,messageId)] }
+  function declineInvitation(serverId, messageId) {
+    inviteSettings.reload(); inviteSettings.text()
+    invitePreferences.declined=Object.assign({},invitePreferences.declined,{[invitationKey(serverId,messageId)]:true})
+    inviteSettings.writeAdapter()
+  }
+  FileView {
+    id:inviteSettings;path:root.bridge.configHome+"/wisp/server-invitations.json"
+    blockLoading:true;blockAllReads:true;blockWrites:true;atomicWrites:true;watchChanges:true;printErrors:false
+    onFileChanged:reload()
+    JsonAdapter {id:invitePreferences;property var declined:({})}
+  }
   function openInvitation(link) {
     if (!/^https:\/\/wisp\.you\/[a-z]+(?:-[a-z]+){0,3}[0-9]{12}$/.test(String(link))
         && !/^https:\/\/[^/?#]+\/join\/#v2\.[A-Za-z0-9_-]{43}$/.test(String(link))) return false

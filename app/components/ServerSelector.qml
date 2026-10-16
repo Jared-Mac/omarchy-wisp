@@ -194,7 +194,6 @@ Item {
       if(!root.member) {root.bridge.accountActions.joinServer();return}
       invitePopup.copied=false
       invitePopup.open()
-      root.bridge.accountActions.act("create_server_invite",{expires_in_minutes:720})
     }
   }
   // Status snapshots replace the server object; only a selection change dismisses the invite.
@@ -210,10 +209,19 @@ Item {
     width:Math.min(root.theme.space(340),root.Window.window ? root.Window.window.width-root.theme.space(24) : root.theme.space(340))
     height:Math.min(inviteContent.implicitHeight+padding*2,root.Window.window ? root.Window.window.height-root.theme.space(40) : root.theme.space(600))
     parent:Overlay.overlay
-    onAboutToShow:{
+    function place() {
+      if (!parent) return
       var point=root.mapToItem(parent,0,root.height)
       x=Math.max(root.theme.space(8),Math.min(point.x,parent.width-width-root.theme.space(8)))
       y=Math.max(root.theme.space(8),Math.min(point.y,parent.height-height-root.theme.space(8)))
+    }
+    onAboutToShow:place()
+    onHeightChanged:if(visible)Qt.callLater(place)
+    onWidthChanged:if(visible)Qt.callLater(place)
+    Connections {
+      target:root.Window.window
+      function onWidthChanged(){if(invitePopup.visible)invitePopup.place()}
+      function onHeightChanged(){if(invitePopup.visible)invitePopup.place()}
     }
     padding:root.theme.spacing.md
     closePolicy:Popup.CloseOnEscape | Popup.CloseOnPressOutside
@@ -223,13 +231,23 @@ Item {
       Column {
         id:inviteContent;width:invitePopup.availableWidth;spacing:root.theme.spacing.sm
         Text {text:"Invite to server";color:root.theme.foreground;font.family:root.theme.font.family;font.pixelSize:root.theme.font.body;font.bold:true}
-        Text {width:parent.width;wrapMode:Text.Wrap;text:"A one-use invitation to "+String(root.bridge.activeServer.name)+". Adding friends is separate.";textFormat:Text.PlainText;color:root.theme.muted;font.family:root.theme.font.family;font.pixelSize:root.theme.font.caption}
+        Text {width:parent.width;wrapMode:Text.Wrap;text:"Invite a friend to "+String(root.bridge.activeServer.name)+" directly, or share a one-use link. Invitations expire after 12 hours.";textFormat:Text.PlainText;color:root.theme.muted;font.family:root.theme.font.family;font.pixelSize:root.theme.font.caption}
         Text {width:parent.width;wrapMode:Text.Wrap;text:root.account.error || root.account.feedback || (root.account.busy ? "Working…" : root.account.invitation ? "Expires "+new Date(root.account.invitation.expires_at).toLocaleString() : "");textFormat:Text.PlainText;color:root.account.error ? root.theme.danger : root.theme.muted;font.family:root.theme.font.family;font.pixelSize:root.theme.font.caption;visible:!!text}
+        Repeater {
+          model:root.bridge.sortedFriends
+          ChatButton {
+            required property var modelData
+            objectName:"inviteFriendToServer-"+modelData.id
+            theme:root.theme;width:parent.width;text:"Invite "+modelData.display_name;iconName:"invite"
+            enabled:!root.account.busy
+            onClicked:root.bridge.accountActions.act("send_server_invite",{friend:String(modelData.id),expires_in_minutes:720})
+          }
+        }
         TextField {id:inviteLink;objectName:"serverInviteLink";width:parent.width;visible:!!root.account.invitation;readOnly:true;selectByMouse:true;text:root.account.invitation ? root.account.invitation.uri : "";ThemeControlStyle {theme:root.theme;control:inviteLink}}
-        ChatButton {theme:root.theme;objectName:"copyServerInvitation";text:invitePopup.copied ? "Copied!" : "Copy invitation";enabled:!!root.account.invitation;onClicked:{root.bridge.copyChatText(inviteLink.text);invitePopup.copied=true}}
-        ChatButton {theme:root.theme;text:invitePopup.showQr ? "Hide QR code" : "Show QR code";enabled:!!root.account.invitation;onClicked:invitePopup.showQr=!invitePopup.showQr}
+        ChatButton {theme:root.theme;objectName:"copyServerInvitation";text:invitePopup.copied ? "Copied!" : "Copy invitation";visible:!!root.account.invitation;onClicked:{root.bridge.copyChatText(inviteLink.text);invitePopup.copied=true}}
+        ChatButton {theme:root.theme;text:invitePopup.showQr ? "Hide QR code" : "Show QR code";visible:!!root.account.invitation;onClicked:invitePopup.showQr=!invitePopup.showQr}
         Image {width:Math.min(parent.width,root.theme.space(224));height:visible ? width : 0;visible:invitePopup.showQr && !!root.account.invitation;source:root.account.invitation && invitePopup.showQr ? root.account.invitation.qr : "";fillMode:Image.PreserveAspectFit;Accessible.name:"Server invitation QR code"}
-        ChatButton {theme:root.theme;text:"New link";enabled:!root.account.busy;onClicked:{invitePopup.copied=false;root.bridge.accountActions.act("create_server_invite",{expires_in_minutes:720})}}
+        ChatButton {theme:root.theme;text:root.account.invitation ? "New link" : "Create invitation link";enabled:!root.account.busy;onClicked:{invitePopup.copied=false;root.bridge.accountActions.act("create_server_invite",{expires_in_minutes:720})}}
         ChatButton {theme:root.theme;text:"Revoke this invitation";visible:!!root.account.invitation;enabled:!root.account.busy;onClicked:root.bridge.accountActions.act("revoke_server_invite",{invite_id:root.account.invitation.id})}
         ChatButton {theme:root.theme;text:"Manage active invitations";enabled:!root.account.busy;onClicked:root.bridge.accountActions.act("list_server_invites",{})}
         Repeater {

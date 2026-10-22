@@ -138,7 +138,27 @@ Item {
   }
   property var watchedMedia: ({})
   property var mediaWatchRequests: ({})
+  property var pendingMediaViews: ({})
   signal mediaWatchReady(var video)
+  function openReadyMediaViews() {
+    Object.keys(pendingMediaViews).forEach(function(key) {
+      var action = root.pendingMediaViews[key]
+      if (action.serverId !== root.voiceServerId || action.hangoutId !== root.selfState.hangout_id) {
+        root.pendingMediaViews = root.replaceEntry(root.pendingMediaViews, key, undefined)
+        return
+      }
+      var video = root.remoteVideos.filter(function(v) {
+        return v.participant === action.video.participant && v.source === action.video.source
+      })[0]
+      if (!video) {
+        root.pendingMediaViews = root.replaceEntry(root.pendingMediaViews, key, undefined)
+      } else if (video.subscribed || video.surface_open) {
+        root.pendingMediaViews = root.replaceEntry(root.pendingMediaViews, key, undefined)
+        root.watchedMedia = root.replaceEntry(root.watchedMedia, key, action.video)
+        root.mediaWatchReady(action.video)
+      }
+    })
+  }
   readonly property string videoSocketPath: socketPath.replace(/\.[^/.]+$/, "") + ".video"
   property int imageViewerSerial: 0
   property var imageViewerFocus: ({})
@@ -202,6 +222,7 @@ Item {
   property var pendingAttachments: ({})
   property var importingConversations: ({})
   property var sendingConversations: ({})
+  property var outgoingMessages: ({})
   property var savedFiles: ({})
   property var savingFiles: ({})
   property var transferProgress: ({})
@@ -300,7 +321,7 @@ Item {
     }
     return !!id
   }
-  signal clipboardTextReady(string conversationId, string value)
+  signal clipboardTextReady(string conversationId, string value, string requestId)
   signal messageMutationFinished(string messageId, string action, bool success, string error)
   signal historyClearFinished(string conversationId, bool success, string error)
   property string roomActionFeedback: ""
@@ -487,11 +508,14 @@ Item {
   function withConversationScope(id, values) {
     return Object.assign({}, values || {}, scopeForConversation(id))
   }
-  readonly property var serverStates: {
-    if ((snapshot.server_states || []).length) return snapshot.server_states
+  // Audio telemetry arrives many times a second with a new snapshot object.
+  // Keep the server/chat models stable when their serialized data is unchanged.
+  readonly property string serverStateData: {
+    if ((snapshot.server_states || []).length) return JSON.stringify(snapshot.server_states)
     var fallback = (snapshot.servers || [])[0] || ({id:"local",name:"Wisp server",connected:daemonConnected})
-    return [{server:fallback,server_member:snapshot.server_member,self:snapshot.self,voice_moderation:snapshot.voice_moderation || {},friends:snapshot.friends || [],hangouts:snapshot.hangouts || [],knocks:snapshot.knocks || [],room_invitations:snapshot.room_invitations || [],conversations:snapshot.conversations || [],messages:snapshot.messages || [],spots:snapshot.spots || [],devices:snapshot.devices || []}]
+    return JSON.stringify([{server:fallback,server_member:snapshot.server_member,self:snapshot.self,voice_moderation:snapshot.voice_moderation || {},friends:snapshot.friends || [],hangouts:snapshot.hangouts || [],knocks:snapshot.knocks || [],room_invitations:snapshot.room_invitations || [],conversations:snapshot.conversations || [],messages:snapshot.messages || [],spots:snapshot.spots || [],devices:snapshot.devices || []}])
   }
+  readonly property var serverStates: JSON.parse(serverStateData)
   readonly property var servers:serverPreferences.sorted
   readonly property var serverCatalog: {
     var values = (snapshot.servers || []).slice()
@@ -736,7 +760,8 @@ Item {
     }
   }
   readonly property var remoteMutedParticipants: mediaState.remote_muted_participants || []
-  readonly property var remoteVideos: mediaState.remote_videos || []
+  readonly property string remoteVideoData: JSON.stringify(mediaState.remote_videos || [])
+  readonly property var remoteVideos: JSON.parse(remoteVideoData)
   readonly property var remoteVideoParticipants: mediaState.remote_video_participants || []
   readonly property bool remoteVideoAvailable: remoteVideos.length > 0
     || remoteVideoParticipants.length > 0
@@ -1011,22 +1036,59 @@ Item {
     return parts.join(" · ")
   }
 
+  function applyMediaSnapshotEffects(previous, next, eventName) {
+    var audioCue = AudioControlSounds.event(previous ? previous.self : null,next.self,eventName)
+    var roomEvents = roomEventsForSnapshots(previous,next,eventName)
+    var shareEvents = ChatLogic.screenShareSoundEvents(previous,next,eventName)
+      .concat(ChatLogic.streamViewerSoundEvents(previous,next,eventName))
+    if (notificationSoundsEnabled && audioCue) playNotificationSound(audioCue)
+    if (notificationSoundsEnabled) shareEvents.forEach(function(kind) { root.playNotificationSound(kind) })
+    if (notificationSoundsEnabled) roomEvents.forEach(function(kind) {
+      if (kind.indexOf("audio_")===0 && !audioControlSounds) return
+      if (kind.indexOf("self_")!==0) root.playNotificationSound(kind)
+    })
+    voiceRecovery.observe(next,eventName)
+    var nextSelf = next["self"] || ({})
+    var nextMedia = nextSelf.media || ({})
+    var nextShare = nextMedia.screen_share || ({})
+    var nextCamera = nextMedia.camera || ({})
+    var mediaError = String(nextMedia.error || nextMedia.surface_error
+      || nextShare.error || nextCamera.error || "")
+    var mediaSignature = mediaErrorSignature(nextMedia)
+    if (mediaSignature !== dismissedMediaError) dismissedMediaError = ""
+    lastError = mediaSignature === dismissedMediaError ? "" : mediaError
+  }
+
   function applySnapshot(next, eventName) {
     if (!next) return
-    var audioCue = AudioControlSounds.event(receivedSnapshot ? snapshot.self : null, next.self, eventName)
+    // Command replies and background events share the socket. An older queued
+    // snapshot must not roll back messages, unread state, or media state.
+    if (receivedSnapshot && Number(next.seq) < Number(snapshot.seq)) return
+    var previous = receivedSnapshot ? snapshot : null
+    var telemetryOnly = previous && (next.server_states || []).length
+      && ["audio_telemetry_changed","audio_input_level_changed","remote_audio_received",
+          "active_speakers_changed","remote_video_received","video_surface_rendered",
+          "screen_share_frame_published","camera_frame_published"].indexOf(eventName)>=0
+      && JSON.stringify(next.server_states)===serverStateData
+    if (telemetryOnly) {
+      snapshot = next
+    reconcileOutgoingMessages()
+      openReadyMediaViews()
+      applyMediaSnapshotEffects(previous,next,eventName)
+      return
+    }
     var previousFlat=receivedSnapshot ? flattenedSnapshot(snapshot) : null
     roomActivity.observe(receivedSnapshot ? snapshot : null,next,eventName)
     var nextFlat=flattenedSnapshot(next)
     var incoming = ChatLogic.incomingConversationIds(previousFlat, nextFlat, eventName)
-    var roomEvents = roomEventsForSnapshots(receivedSnapshot ? snapshot : null,next,eventName)
-    var shareEvents = ChatLogic.screenShareSoundEvents(receivedSnapshot ? snapshot : null,next,eventName)
-      .concat(ChatLogic.streamViewerSoundEvents(receivedSnapshot ? snapshot : null,next,eventName))
     var knownInvites = (previousFlat ? previousFlat.room_invitations : []).map(function(i) { return String(i.server_id)+":"+String(i.id) })
     var newInvite = receivedSnapshot && nextFlat.room_invitations.some(function(i) {
       return Date.parse(i.expires_at) > Date.now() && knownInvites.indexOf(String(i.server_id)+":"+String(i.id)) < 0
     })
     unreadMarkers.observe(previousFlat, nextFlat, eventName, next)
     snapshot = next
+    reconcileOutgoingMessages()
+    openReadyMediaViews()
     typing.reconcile()
     Qt.callLater(function() { friendships.sync(eventName || "") })
     privacySnapshotReady = true
@@ -1051,26 +1113,13 @@ Item {
       }).map(function(id) { return {id:id,background:true} })
       if (incomingDms.length) pendingConversationTiles=pendingConversationTiles.concat(incomingDms)
     }
-    if (notificationSoundsEnabled && audioCue) playNotificationSound(audioCue)
     if (notificationSoundsEnabled && newInvite) playNotificationSound("room_invite")
-    if (notificationSoundsEnabled) shareEvents.forEach(function(kind) { root.playNotificationSound(kind) })
-    if (notificationSoundsEnabled) roomEvents.forEach(function(kind) { if (kind.indexOf("audio_") === 0 && !audioControlSounds) return []
-    if (kind.indexOf("self_") !== 0) root.playNotificationSound(kind) })
-    voiceRecovery.observe(next, eventName)
+    applyMediaSnapshotEffects(previous,next,eventName)
     var mentionChats=notificationMentionsOnly ? incomingMentionChats(previousFlat,nextFlat,eventName,next) : []
     if (notificationSoundsEnabled && (notificationMentionsOnly ? mentionChats : incoming).some(function(id) {
       return ChatLogic.shouldNotifyChat(id, root.focusedConversationId, root.appFocused,
         root.notificationPolicy, root.mutedNotificationChats, root.notificationMuted, root.notificationVolume)
     })) playNotificationSound()
-    var nextSelf = next["self"] || ({})
-    var nextMedia = nextSelf.media || ({})
-    var nextShare = nextMedia.screen_share || ({})
-    var nextCamera = nextMedia.camera || ({})
-    var mediaError = String(nextMedia.error || nextMedia.surface_error
-      || nextShare.error || nextCamera.error || "")
-    var mediaSignature = mediaErrorSignature(nextMedia)
-    if (mediaSignature !== dismissedMediaError) dismissedMediaError = ""
-    lastError = mediaSignature === dismissedMediaError ? "" : mediaError
     if (pendingDirectName !== "") {
       var wanted = pendingDirectName
       var wantedServer = pendingDirectServerId
@@ -1120,6 +1169,17 @@ Item {
     return null
   }
 
+  function reconcileOutgoingMessages() {
+    var next={}, changed=false
+    Object.keys(outgoingMessages).forEach(function(key) {
+      var item=outgoingMessages[key]
+      if (item.status==="sent" && item.messageId && messages.some(function(m) {
+        return String(m.id)===item.messageId && String(m.conversation_id)===item.message.conversation_id
+      })) changed=true
+      else next[key]=item
+    })
+    if (changed) outgoingMessages=next
+  }
   function messagesFor(id) {
     var result = []
     if (!id) return result
@@ -1127,6 +1187,16 @@ Item {
     var canonical=conversation ? String(conversation.id) : String(id)
     for (var i = 0; i < messages.length; i++)
       if (String(messages[i].conversation_id) === canonical) result.push(messages[i])
+    var outgoing = conversationValue(outgoingMessages, canonical, null)
+    if (outgoing) {
+      if (outgoing.messageId && result.some(function(m) { return String(m.id) === outgoing.messageId })) return result
+      // A snapshot can arrive before the send acknowledgement. Hold new own
+      // messages until its exact ID arrives, rather than matching by text.
+      if (outgoing.status === "sending") result = result.filter(function(m) {
+        return String(m.sender.id) !== String(outgoing.message.sender.id) || outgoing.knownIds.indexOf(String(m.id)) >= 0
+      })
+      result.push(Object.assign({}, outgoing.message, {id:outgoing.messageId || outgoing.message.id, delivery_status:outgoing.status}))
+    }
     return result
   }
 
@@ -1263,6 +1333,7 @@ Item {
       requests[id] = { kind: "paste", conversationId: conversationId }
       importingConversations = replaceConversationEntry(importingConversations, conversationId, Number(conversationValue(importingConversations,conversationId,0)) + 1)
     }
+    return id || ""
   }
   function attachmentsFor(id) { return conversationValue(pendingAttachments,id,[]) || [] }
   function setAttachmentKeep(conversationId, token, keep) {
@@ -1314,8 +1385,33 @@ Item {
     var reply=messageActions.replyFor(conversationId)
     var id = send(reply ? "send_reply" : "send_message", withConversationScope(conversationId, {text: text,reply_to:reply ? reply.message_id : undefined}))
     if (id) {
-      requests[id] = {kind: "send", conversationId: conversationId, text: draftFor(conversationId), token: "",replyId:reply ? reply.message_id : ""}
+      var c=conversationById(conversationId), canonical=c ? String(c.id) : conversationId
+      var state=serverStates.filter(function(v) { return String(v.server.id)===String((c || {}).server_id) })[0]
+      outgoingMessages=replaceConversationEntry(outgoingMessages,canonical,{
+        status:"sending",messageId:"",reply:reply,
+        knownIds:messagesFor(canonical).map(function(m) { return String(m.id) }),
+        message:{id:"outgoing-"+id,conversation_id:canonical,server_id:(c || {}).server_id,
+          sender:state ? state.self : selfState,created_at:new Date().toISOString(),content_type:"text/plain",payload:text,
+          context:reply ? {reply_to:reply} : null}})
+      requests[id] = {kind: "send", conversationId: conversationId, text: draftFor(conversationId), token: "",replyId:reply ? reply.message_id : "", optimistic:true}
     } else sendingConversations = replaceConversationEntry(sendingConversations, conversationId, undefined)
+  }
+  function recoverOutgoing(conversationId) {
+    var outgoing=conversationValue(outgoingMessages,conversationId,null)
+    if (!outgoing || outgoing.status!=="failed" || (draftFor(conversationId).trim() && draftFor(conversationId).trim()!==outgoing.message.payload)) return
+    // Delivery can be uncertain after a lost connection. Restore for review;
+    // never silently resend a message that the recipient may already have.
+    setDraft(conversationId,outgoing.message.payload)
+    if (outgoing.reply) messageActions.replies=replaceEntry(messageActions.replies,messageActions.canonical(conversationId),outgoing.reply)
+    outgoingMessages=replaceConversationEntry(outgoingMessages,conversationId,undefined)
+  }
+  function failOutgoing() {
+    var next={}
+    Object.keys(outgoingMessages).forEach(function(key) {
+      var item=outgoingMessages[key]
+      next[key]=item.status==="sending" ? Object.assign({},item,{status:"failed"}) : item
+    })
+    outgoingMessages=next
   }
   function saveChatFile(messageId) {
     if (savingFiles[messageId]) return
@@ -1466,8 +1562,11 @@ Item {
       if (message.ok && action.open && action.serverId === voiceServerId
           && action.hangoutId === selfState.hangout_id
           && remoteVideos.some(function(video) { return video.participant === action.video.participant && video.source === action.video.source })) {
-        watchedMedia = replaceEntry(watchedMedia, action.key, action.video)
-        mediaWatchReady(action.video)
+        // Command replies can overtake queued snapshots from before Watch.
+        // Wait for the subscription snapshot before creating its viewer, or
+        // syncVideos would immediately remove it on an old audio update.
+        pendingMediaViews = replaceEntry(pendingMediaViews, action.key, action)
+        openReadyMediaViews()
       } else if (!action.open || !message.ok) watchedMedia = replaceEntry(watchedMedia, action.key, undefined)
     } else if (action.kind === "setting") {
       if (message.ok) settingsSaved()
@@ -1476,6 +1575,7 @@ Item {
       messageMutationFinished(action.messageId, action.kind, !!message.ok,
         message.error ? String(message.error.message || "Could not update message") : "")
     } else if (action.kind === "clear") {
+      if (message.ok) outgoingMessages=replaceConversationEntry(outgoingMessages,action.conversationId,undefined)
       historyClearFinished(action.conversationId, !!message.ok, message.error ? String(message.error.message || "Could not clear history") : "")
     } else if (action.kind === "newChat") {
       var created = !!message.ok && !!value.id
@@ -1492,6 +1592,13 @@ Item {
       if (message.ok && action.action === "create_room" && value.id) activeConversationId = scopedConversationId(action.serverId,value.id)
       roomActionFinished(action.action, !!message.ok, message.error ? String(message.error.message || "Could not update room") : "")
     } else if (action.kind === "send") {
+      if (action.optimistic) {
+        var outgoing=conversationValue(outgoingMessages,conversationId,null)
+        if (outgoing) outgoingMessages=replaceConversationEntry(outgoingMessages,conversationId,
+          Object.assign({},outgoing,{status:message.ok ? "sent" : "failed",messageId:message.ok ? String(value.message_id || "") : ""}))
+        reconcileOutgoingMessages()
+      }
+
       if (message.ok) {
         acknowledgeConversation(conversationId,true)
         if (action.text !== undefined && draftFor(conversationId) === action.text) setDraft(conversationId, "")
@@ -1510,7 +1617,7 @@ Item {
       if (message.ok) {
         var added = value.attachments || (value.token ? [value] : [])
         if (added.length > 0) pendingAttachments = replaceConversationEntry(pendingAttachments, conversationId, attachmentsFor(conversationId).concat(added))
-        else if (value.text !== undefined) clipboardTextReady(conversationId, String(value.text))
+        else if (value.text !== undefined) clipboardTextReady(conversationId, String(value.text), String(message.id))
       }
     } else if (action.kind === "saveFile") {
       savingFiles = replaceEntry(savingFiles, action.messageId, undefined)
@@ -1676,6 +1783,7 @@ Item {
     if (!video) return
     if (delegateMediaToDesktop) { desktopWatchRequested(String(video.participant),String(video.source),open,String(video.presentation || "")); return }
     var key = JSON.stringify([String(video.participant), String(video.source)])
+    pendingMediaViews = replaceEntry(pendingMediaViews, key, undefined)
     var id = send("watch_video", {
       "participant": String(video.participant || ""),
       "source": String(video.source || "screen_share"),
@@ -1717,7 +1825,10 @@ Item {
           root.sendThrough(connection, "refresh_video_devices", {})
         } else {
           root.receivedSnapshot = false
+          root.failOutgoing()
           root.requests = ({})
+          root.mediaWatchRequests = ({})
+          root.pendingMediaViews = ({})
           root.audioTestBusy = false
           root.audioTestState = {phase:"idle", duration_ms:0}
           root.audioTestClearPending = false

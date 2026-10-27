@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "dev.wisp",
   "name": "Wisp",
-  "version": "0.1.0+51ddac242a3c",
+  "version": "0.1.0+0010d8c5c4df",
   "author": "Wisp contributors",
   "license": "AGPL-3.0-only",
   "description": "Voice-first presence and hangouts for a small circle of friends.",
